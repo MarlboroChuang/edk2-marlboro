@@ -470,6 +470,65 @@ XhcWaitOpRegBit (
 }
 
 /**
+  Wait the PortSc register's bit as specified by Bit to become set (or clear).
+  Sometime device will be disapeared so that need to check the Xhc and Port status
+
+  @param  Xhc          The XHCI Instance.
+  @param  Offset       The offset of the operation register.
+  @param  Bit          The bit of the register to wait for.
+  @param  WaitToSet    Wait the bit to set or clear.
+  @param  Timeout      The time to wait before abort (in millisecond, ms).
+
+  @retval EFI_SUCCESS       The bit successfully changed by host controller.
+  @retval EFI_DEVICE_ERROR  The device error occurred.
+  @retval EFI_TIMEOUT       The time out occurred.
+
+**/
+EFI_STATUS
+XhcWaitPortScBit (
+  IN USB_XHCI_INSTANCE  *Xhc,
+  IN UINT32             Offset,
+  IN UINT32             Bit,
+  IN BOOLEAN            WaitToSet,
+  IN UINT32             Timeout
+  )
+{
+  UINT64  TimeoutTicks;
+  UINT64  ElapsedTicks;
+  UINT64  TicksDelta;
+  UINT64  CurrentTick;
+
+  if (Timeout == 0) {
+    return EFI_TIMEOUT;
+  }
+
+  TimeoutTicks = XhcConvertTimeToTicks (XHC_MICROSECOND_TO_NANOSECOND (Timeout * XHC_1_MILLISECOND));
+  ElapsedTicks = 0;
+  CurrentTick  = GetPerformanceCounter ();
+  do {
+    if (XHC_REG_BIT_IS_SET (Xhc, Offset, Bit) == WaitToSet) {
+      return EFI_SUCCESS;
+    }
+
+    if (!XHC_REG_BIT_IS_SET (Xhc, Offset, XHC_PORTSC_CCS)) {
+      DEBUG ((DEBUG_INFO, "The Port CCS is not set.\n"));
+      return EFI_NOT_FOUND;
+    }
+
+    gBS->Stall (XHC_1_MILLISECOND);
+    TicksDelta = XhcGetElapsedTicks (&CurrentTick);
+    // Ensure that ElapsedTicks is always incremented to avoid indefinite hangs
+    if (TicksDelta == 0) {
+      TicksDelta = XhcConvertTimeToTicks (XHC_MICROSECOND_TO_NANOSECOND (XHC_1_MILLISECOND));
+    }
+
+    ElapsedTicks += TicksDelta;
+  } while (ElapsedTicks < TimeoutTicks);
+
+  return EFI_TIMEOUT;
+}
+
+/**
   Set Bios Ownership
 
   @param  Xhc          The XHCI Instance.

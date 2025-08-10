@@ -1716,6 +1716,9 @@ XhcMonitorAsyncRequests (
   URB                *Urb;
   UINT8              SlotId;
   EFI_STATUS         Status;
+  UINT64             XhcDequeue;
+  UINT32             High;
+  UINT32             Low;
   EFI_TPL            OldTpl;
 
   OldTpl = gBS->RaiseTPL (XHC_TPL);
@@ -1822,6 +1825,18 @@ XhcMonitorAsyncRequests (
       gBS->FreePool (ProcBuf);
     }
   }
+  //
+  // Advance event ring to last available entry
+  //
+  // EHB bit shall be cleared otherwise the interrupt would be stuck.
+  // Some 3rd party XHCI external cards don't support single 64-bytes width register access,
+  // So divide it to two 32-bytes width register access.
+  //
+  Low        = XhcReadRuntimeReg (Xhc, XHC_ERDP_OFFSET);
+  High       = XhcReadRuntimeReg (Xhc, XHC_ERDP_OFFSET + 4);
+  XhcDequeue = (UINT64)(LShiftU64 ((UINT64)High, 32) | Low);
+  XhcWriteRuntimeReg (Xhc, XHC_ERDP_OFFSET, XHC_LOW_32BIT (XhcDequeue) | BIT3);
+  XhcWriteRuntimeReg (Xhc, XHC_ERDP_OFFSET + 4, XHC_HIGH_32BIT (XhcDequeue));
   gBS->RestoreTPL (OldTpl);
 }
 
@@ -1903,7 +1918,7 @@ XhcPollPortStatusChange (
       // Execute Enable_Slot cmd for attached device, initialize device context and assign device address.
       //
       SlotId = XhcRouteStringToSlotId (Xhc, RouteChart);
-      if ((SlotId == 0) && ((PortState->PortChangeStatus & USB_PORT_STAT_C_RESET) != 0)) {
+      if (SlotId == 0) {
         if (Xhc->HcCParams.Data.Csz == 0) {
           Status = XhcInitializeDeviceSlot (Xhc, ParentRouteChart, Port, RouteChart, Speed);
         } else {

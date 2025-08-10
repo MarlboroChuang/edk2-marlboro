@@ -402,6 +402,12 @@ XhcGetRootHubPortStatus (
   PortStatus->PortStatus       = 0;
   PortStatus->PortChangeStatus = 0;
 
+  // If the XHC is halted by error occuring, get port status should be return error immediately
+  if (EFI_DEVICE_ERROR == XhcWaitPortScBit (Xhc, Offset, XHC_PORTSC_RESET, FALSE, XHC_RESET_TIMEOUT)) {
+    Status = EFI_DEVICE_ERROR;
+    goto ON_EXIT;
+  }
+
   State = XhcReadOpReg (Xhc, Offset);
 
   PortSpeed = (State & XHC_PORTSC_PS) >> 10;
@@ -583,9 +589,9 @@ XhcSetRootHubPortFeature (
       // 4.3.1 Resetting a Root Hub Port
       // 1) Write the PORTSC register with the Port Reset (PR) bit set to '1'.
       //
-      State |= XHC_PORTSC_RESET;
+      State |= XHC_PORTSC_RESET | XHC_PORTSC_PRC;
       XhcWriteOpReg (Xhc, Offset, State);
-      XhcWaitOpRegBit (Xhc, Offset, XHC_PORTSC_PRC, TRUE, XHC_GENERIC_TIMEOUT);
+      XhcWaitPortScBit (Xhc, Offset, XHC_PORTSC_PRC, TRUE, XHC_GENERIC_TIMEOUT);
       break;
 
     case EfiUsbPortPower:
