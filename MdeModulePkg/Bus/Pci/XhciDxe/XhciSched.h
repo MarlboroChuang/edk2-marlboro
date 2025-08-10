@@ -211,6 +211,9 @@ typedef struct _URB {
   BOOLEAN                            Finished;
 
   TRB_TEMPLATE                       *EvtTrb;
+
+  // Short packet counter
+  UINTN                              ShortPacketOccurence;
 } URB;
 
 //

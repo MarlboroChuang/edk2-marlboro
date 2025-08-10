@@ -324,6 +324,7 @@ XhcCreateTransferTrb (
   Urb->EndDone              = FALSE;
   Urb->Completed            = 0;
   Urb->Result               = EFI_USB_NOERROR;
+  Urb->ShortPacketOccurence = 0;
 
   Dci = XhcEndpointToDci (Urb->Ep.EpAddr, (UINT8)(Urb->Ep.Direction));
   ASSERT (Dci < 32);
@@ -576,7 +577,14 @@ XhcCreateTransferTrb (
 
     default:
       DEBUG ((DEBUG_INFO, "Not supported EPType 0x%x!\n", EPType));
-      ASSERT (FALSE);
+      //
+      // We are seeing intermittent failures when the xHC failed to update the
+      // endpoint context of the device context data structure with a Belkin mouse.
+      // The Endpoint Conext EPType could be 0 in that case.
+      // We don't want to halt the system because of that, instead we can give up
+      // on this device and continue.
+      //
+      return EFI_DEVICE_ERROR;
       break;
   }
 
@@ -1455,6 +1463,10 @@ XhcCheckUrbResult (
       case TRB_COMPLETION_SUCCESS:
         if (EvtTrb->Completecode == TRB_COMPLETION_SHORT_PACKET) {
           DEBUG ((DEBUG_VERBOSE, "XhcCheckUrbResult: short packet happens!\n"));
+          //
+          // Advance the short packet counter
+          //
+          CheckedUrb->ShortPacketOccurence++;
         }
 
         TRBType = (UINT8)(TRBPtr->Type);
@@ -1462,7 +1474,13 @@ XhcCheckUrbResult (
             (TRBType == TRB_TYPE_NORMAL) ||
             (TRBType == TRB_TYPE_ISOCH))
         {
-          CheckedUrb->Completed += (((TRANSFER_TRB_NORMAL *)TRBPtr)->Length - EvtTrb->Length);
+          //
+          // By XHCI spec 4.10.1.1.2 to discard any following short packet or completion event
+          // after first occurrence of a short packet.
+          //
+          if (2 > CheckedUrb->ShortPacketOccurence) {
+            CheckedUrb->Completed += (((TRANSFER_TRB_NORMAL *)TRBPtr)->Length - EvtTrb->Length);
+          }
         }
 
         break;
