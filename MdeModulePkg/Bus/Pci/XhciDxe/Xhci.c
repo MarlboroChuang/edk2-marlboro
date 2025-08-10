@@ -429,6 +429,13 @@ XhcGetRootHubPortStatus (
 
         case 4:
         case 5:
+        //
+        // According to XHCI 1.2 spec, default USB speed ID mapping
+        // 6 - SuperSpeedPlus Gen1 x2
+        // 7 - SuperSpeedPlus Gen2 x2
+        //
+        case 6:
+        case 7:
           PortStatus->PortStatus |= USB_PORT_STAT_SUPER_SPEED;
           break;
 
@@ -2082,6 +2089,12 @@ XhcDriverBindingStart (
 
   XhcSetBiosOwnership (Xhc);
 
+  // Per Xhci spec Ch.4.2,
+  // After Chip Hardware Reset6 wait until the Controller Not Ready (CNR) flag
+  // in the USBSTS is '0' before writing any xHC Operational or Runtime registers.
+  Status = XhcWaitOpRegBit (Xhc, XHC_USBSTS_OFFSET, XHC_USBSTS_CNR, FALSE, XHC_RESET_TIMEOUT);
+  ASSERT_EFI_ERROR (Status);
+
   Status = XhcResetHC (Xhc, XHC_RESET_TIMEOUT);
   if (EFI_ERROR (Status)) {
     DEBUG ((DEBUG_ERROR, "%a: failed to reset HC\n", __func__));
@@ -2094,6 +2107,8 @@ XhcDriverBindingStart (
   // After Chip Hardware Reset wait until the Controller Not Ready (CNR) flag
   // in the USBSTS is '0' before writing any xHC Operational or Runtime registers.
   //
+  Status = XhcWaitOpRegBit (Xhc, XHC_USBSTS_OFFSET, XHC_USBSTS_CNR, FALSE, XHC_RESET_TIMEOUT);
+  ASSERT_EFI_ERROR (Status);
   ASSERT (!(XHC_REG_BIT_IS_SET (Xhc, XHC_USBSTS_OFFSET, XHC_USBSTS_CNR)));
 
   //

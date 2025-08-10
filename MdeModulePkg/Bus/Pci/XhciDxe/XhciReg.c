@@ -901,6 +901,12 @@ XhcHaltHC (
 
   XhcClearOpRegBit (Xhc, XHC_USBCMD_OFFSET, XHC_USBCMD_RUN);
   Status = XhcWaitOpRegBit (Xhc, XHC_USBSTS_OFFSET, XHC_USBSTS_HALT, TRUE, Timeout);
+
+  //
+  // Clear USBSTS_PCD bit.
+  //
+  XhcSetOpRegBit (Xhc, XHC_USBSTS_OFFSET, XHC_USBSTS_PCD);
+
   return Status;
 }
 
