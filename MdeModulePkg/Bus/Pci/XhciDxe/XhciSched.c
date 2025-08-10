@@ -14,6 +14,48 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
 #include "Xhci.h"
 
 /**
+  Get EP State by Urb.
+
+  @param  Xhc       The XHCI Instance.
+  @param  Urb       The Urb to be executed.
+  @param  EpState   The EP state returned ptr.
+
+  @return EFI_STATUS
+
+**/
+EFI_STATUS
+XhcGetEpStateByUrb (
+  IN  USB_XHCI_INSTANCE  *Xhc,
+  IN  URB                *Urb,
+  OUT XHCI_EP_STATE      *EpState
+  )
+{
+  UINT8  SlotId         = 0;
+  UINT8  Dci            = 0;
+  VOID   *OutputContext = NULL;
+
+  if (Urb->Ring == &Xhc->CmdRing) {
+    *EpState = EP_RUNNING;
+  } else {
+    SlotId = XhcBusDevAddrToSlotId (Xhc, Urb->Ep.BusAddr);
+    if (SlotId == 0) {
+      return EFI_DEVICE_ERROR;
+    }
+
+    Dci = XhcEndpointToDci (Urb->Ep.EpAddr, (UINT8)(Urb->Ep.Direction));
+    ASSERT (Dci < 32);
+    OutputContext = Xhc->UsbDevContext[SlotId].OutputContext;
+    if (Xhc->HcCParams.Data.Csz == 0) {
+      *EpState = (UINT8)((DEVICE_CONTEXT *)OutputContext)->EP[Dci-1].EPState;
+    } else {
+      *EpState = (UINT8)((DEVICE_CONTEXT_64 *)OutputContext)->EP[Dci-1].EPState;
+    }
+  }
+
+  return EFI_SUCCESS;
+}
+
+/**
   Create a command transfer TRB to support XHCI command interfaces.
 
   @param  Xhc       The XHCI Instance.
@@ -719,6 +761,126 @@ XhcInitSched (
 }
 
 /**
+  Reset endpoint through XHCI's Reset_Endpoint cmd with TSP = 1.
+
+  @param  Xhc                   The XHCI Instance.
+  @param  SlotId                The slot id to be configured.
+  @param  Dci                   The device context index of endpoint.
+
+  @retval EFI_SUCCESS           Reset endpoint successfully.
+  @retval Others                Failed to reset endpoint.
+
+**/
+EFI_STATUS
+EFIAPI
+XhcResetEndpointForSoftRetry (
+  IN USB_XHCI_INSTANCE  *Xhc,
+  IN UINT8              SlotId,
+  IN UINT8              Dci
+  )
+{
+  EFI_STATUS                  Status;
+  EVT_TRB_COMMAND_COMPLETION  *EvtTrb;
+  CMD_TRB_RESET_ENDPOINT      CmdTrbResetED;
+
+  DEBUG ((DEBUG_INFO, "[%a] Slot = 0x%x, Dci = 0x%x\n", __func__, SlotId, Dci));
+  //
+  // Send stop endpoint command to transit Endpoint from running to stop state
+  //
+  ZeroMem (&CmdTrbResetED, sizeof (CmdTrbResetED));
+  CmdTrbResetED.CycleBit = 1;
+  CmdTrbResetED.Type     = TRB_TYPE_RESET_ENDPOINT;
+  CmdTrbResetED.EDID     = Dci;
+  CmdTrbResetED.TSP      = 1;
+  CmdTrbResetED.SlotId   = SlotId;
+  Status                 = XhcCmdTransfer (
+                             Xhc,
+                             (TRB_TEMPLATE *)(UINTN)&CmdTrbResetED,
+                             XHC_GENERIC_TIMEOUT,
+                             (TRB_TEMPLATE **)(UINTN)&EvtTrb
+                             );
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "[%a] Reset Endpoint Failed, Status = %r\n", __func__, Status));
+  }
+
+  return Status;
+}
+
+/**
+  System software shall use a Reset Endpoint Command with TSP = 1 (section 4.6.8.1) to remove the Halted
+  condition in the xHC when software get the transaction error.
+  After the successful completion of the Reset Endpoint Command with TSP = 1, the Endpoint Context is transitioned
+  from the Halted to the Stopped state but does not change the state of Data Toggle or Sequence Number and allows Xhc to
+  continue the retry process another CErr times and the Transfer Ring of the endpoint is reenabled.
+  The next write to the Doorbell of the Endpoint will transition the Endpoint Context from the Stopped to the Running state.
+
+  @param  Xhc                   The XHCI Instance.
+  @param  SlotId                The slot id to be configured.
+  @param  Dci                   The device context index of endpoint.
+
+  @retval EFI_SUCCESS           The recovery is successful.
+  @retval Others                Failed to recovery halted endpoint.
+
+**/
+EFI_STATUS
+EFIAPI
+XhcRecoverHaltedEndpointForSoftRetry (
+  IN  USB_XHCI_INSTANCE  *Xhc,
+  IN  UINT8              SlotId,
+  IN  UINT8              Dci
+  )
+{
+  EFI_STATUS  Status;
+
+  DEBUG ((DEBUG_INFO, "[%a] Recovery Halted Slot = %x,Dci = %x\n", __func__, SlotId, Dci));
+  Status = EFI_SUCCESS;
+  //
+  // 1) Send Reset endpoint command to transit from halt to stop state
+  //
+  Status = XhcResetEndpointForSoftRetry (Xhc, SlotId, Dci);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "[%a]: Reset Endpoint Failed, Status = %r\n", __func__, Status));
+    return Status;
+  }
+
+  //
+  // 2)Ring the doorbell to transit from stop to active
+  //
+  XhcRingDoorBell (Xhc, SlotId, Dci);
+
+  return Status;
+}
+
+BOOLEAN
+IsUrbNeedSoftRetry (
+  IN  USB_XHCI_INSTANCE  *Xhc,
+  IN  UINT8              SlotId,
+  IN  UINT8              Dci,
+  IN  URB                *Urb,
+  IN  UINT8              EPType
+  )
+{
+  BOOLEAN  NeedSoftRetry = FALSE;
+
+  if (  (Urb->EvtTrb != NULL)
+     && (Urb->Result & EDKII_USB_ERR_TRANSACTION)
+     && (((EVT_TRB_TRANSFER *)(Urb->EvtTrb))->Completecode == TRB_COMPLETION_USB_TRANSACTION_ERROR))
+  {
+    DEBUG ((DEBUG_INFO, "[%a]: CompleteCode is TRB_COMPLETION_USB_TRANSACTION_ERROR\n", __func__));
+    if (SlotId == 0) {
+      NeedSoftRetry = TRUE;
+    } else if (  (EPType != ED_ISOCH_IN)
+              && (EPType != ED_ISOCH_OUT)
+              && (Xhc->UsbDevContext[SlotId].ParentRouteString.Dword == 0))
+    {
+      NeedSoftRetry = TRUE;
+    }
+  }
+
+  return NeedSoftRetry;
+}
+
+/**
   System software shall use a Reset Endpoint Command (section 4.11.4.7) to remove the Halted
   condition in the xHC. After the successful completion of the Reset Endpoint Command, the Endpoint
   Context is transitioned from the Halted to the Stopped state and the Transfer Ring of the endpoint is
@@ -1249,6 +1411,8 @@ XhcCheckUrbResult (
       continue;
     }
 
+    CheckedUrb->EvtTrb = (TRB_TEMPLATE *)EvtTrb;
+
     switch (EvtTrb->Completecode) {
       case TRB_COMPLETION_STALL_ERROR:
         CheckedUrb->Result  |= EFI_USB_ERR_STALL;
@@ -1353,6 +1517,8 @@ EXIT:
   return Urb->Finished;
 }
 
+#define SOFT_RETRY_COUNT  500
+
 /**
   Execute the transfer by polling the URB. This is a synchronous operation.
 
@@ -1374,19 +1540,34 @@ XhcExecTransfer (
   IN  UINTN              Timeout
   )
 {
-  EFI_STATUS  Status;
-  UINT8       SlotId;
-  UINT8       Dci;
-  BOOLEAN     Finished;
-  UINT64      TimeoutTicks;
-  UINT64      ElapsedTicks;
-  UINT64      TicksDelta;
-  UINT64      CurrentTick;
-  BOOLEAN     IndefiniteTimeout;
+  EFI_STATUS     Status;
+  UINT8          SlotId;
+  UINT8          Dci;
+  BOOLEAN        Finished;
+  UINT64         TimeoutTicks;
+  UINT64         ElapsedTicks;
+  UINT64         TicksDelta;
+  UINT64         CurrentTick;
+  BOOLEAN        IndefiniteTimeout;
+  EFI_STATUS     RecoverEpStatus;
+  UINTN          SoftRetries;
+  XHCI_EP_STATE  EpState;
+  UINT8          EPType;
 
   Status            = EFI_SUCCESS;
   Finished          = FALSE;
   IndefiniteTimeout = FALSE;
+
+  Status = XhcGetEpStateByUrb (Xhc, Urb, &EpState);
+  if (!EFI_ERROR (Status)) {
+    if (EpState == EP_HALTED) {
+      Urb->Result = EFI_USB_ERR_TIMEOUT;
+      Status      = EFI_TIMEOUT;
+      return Status;
+    }
+  } else {
+    return EFI_DEVICE_ERROR;
+  }
 
   if (CmdTransfer) {
     SlotId = 0;
@@ -1400,6 +1581,18 @@ XhcExecTransfer (
     Dci = XhcEndpointToDci (Urb->Ep.EpAddr, (UINT8)(Urb->Ep.Direction));
     ASSERT (Dci < 32);
   }
+
+  if (CmdTransfer) {
+    EPType = ED_CONTROL_BIDIR;
+  } else {
+    if (Xhc->HcCParams.Data.Csz == 0) {
+      EPType = (UINT8)((DEVICE_CONTEXT *)(Xhc->UsbDevContext[SlotId].OutputContext))->EP[Dci-1].EPType;
+    } else {
+      EPType = (UINT8)((DEVICE_CONTEXT_64 *)(Xhc->UsbDevContext[SlotId].OutputContext))->EP[Dci-1].EPType;
+    }
+  }
+
+  SoftRetries = SOFT_RETRY_COUNT;
 
   if (Timeout == 0) {
     IndefiniteTimeout = TRUE;
@@ -1418,7 +1611,49 @@ XhcExecTransfer (
   do {
     Finished = XhcCheckUrbResult (Xhc, Urb);
     if (Finished) {
+      //
+      // XHCI spec 4.6.8.1 - Software can do Soft Retry for Usb Transaction Error
+      //
+      if (IsUrbNeedSoftRetry (Xhc, SlotId, Dci, Urb, EPType)) {
+        DEBUG ((DEBUG_INFO, "[%a] IsUrbNeedSoftRetry = TRUE, SoftRetries = %d\n", __func__, SoftRetries));
+        if (SoftRetries-- > 0) {
+          RecoverEpStatus = XhcRecoverHaltedEndpointForSoftRetry (Xhc, SlotId, Dci);
+          DEBUG ((DEBUG_ERROR, "[%a] XhcRecoverHaltedEndpointForSoftRetry Status = %r!\n", __func__, RecoverEpStatus));
+          if (!EFI_ERROR (RecoverEpStatus)) {
+            Urb->Result   = EFI_USB_NOERROR;
+            Urb->Finished = FALSE;
+            Urb->EvtTrb   = NULL;
+            gBS->Stall (XHC_1_MILLISECOND);
+            continue;
+          }
+        }
+      }
+
       break;
+    } else {
+      if (SoftRetries == 0) {
+        //
+        // Here means that BIOS did the Soft Retry but not worked and it seems to have another error occurred.
+        // Transfer is not finished so that break here immediately.
+        //
+        DEBUG ((DEBUG_INFO, "[%a] SoftRetries == 0, return EDKII_USB_ERR_TRANSACTION\n", __func__));
+        Urb->Result  |= EDKII_USB_ERR_TRANSACTION;
+        Urb->Finished =  TRUE;
+        break;
+      } else if ((Urb->EvtTrb != NULL) && (Urb->Result == EFI_USB_NOERROR) && (SoftRetries < SOFT_RETRY_COUNT)) {
+        //
+        // Here means that this Urb back to normal transaction so reset the SoftRetry.
+        //
+        DEBUG ((DEBUG_INFO, "[%a] Urb->EvtTrb != NULL, Urb->Result == EFI_USB_NOERROR\n", __func__));
+        SoftRetries = SOFT_RETRY_COUNT;
+      } else {
+        //
+        // Here means that this Urb is going normal transfer.
+        // No need to decrease the SoftRetries, just keep waiting next transfer.
+        //
+      }
+
+      Urb->EvtTrb = NULL;
     }
 
     gBS->Stall (XHC_1_MICROSECOND);
